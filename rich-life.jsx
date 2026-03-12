@@ -757,6 +757,7 @@ export default function App(){
     })();
   },[txns.filter(t=>t._needsRateUpdate||(!t.exchangeRate&&t.currency&&t.currency!=="BRL")).length]);
   const cancelEdit=useCallback(()=>{setEditingCell(null);setEditVal("");setEditCurrency("BRL");},[]);
+  const isEditing=useCallback((id,field,type)=>editingCell&&editingCell.id===id&&editingCell.field===field&&editingCell.type===type,[editingCell]);
   const handleCreateCat=useCallback(async()=>{if(!newCatName.trim()||!newCatDesc.trim())return;const name=newCatName.trim(),cat={name,color:newCatColor,desc:newCatDesc.trim()};setCategories(prev=>[...prev,cat]);const uncat=txns.filter(t=>!t.category);if(uncat.length>0){setAiLoading(true);try{const indices=await aiCategorize(uncat,name,newCatDesc.trim(),[...categories,cat]);setAiResult({indices,catName:name,txnIds:indices.map(i=>uncat[i]?.id).filter(Boolean)});}catch(e){setAiResult({indices:[],catName:name,txnIds:[],error:true});}setAiLoading(false);}else{setShowNewCat(false);setNewCatName("");setNewCatDesc("");}},[newCatName,newCatDesc,newCatColor,categories,txns]);
   const acceptAi=useCallback(()=>{if(!aiResult)return;setTxns(p=>p.map(t=>aiResult.txnIds.includes(t.id)?{...t,category:aiResult.catName,confirmed:true}:t));setAiResult(null);setShowNewCat(false);setNewCatName("");setNewCatDesc("");},[aiResult]);
   const rejectAi=useCallback(()=>{setAiResult(null);setShowNewCat(false);setNewCatName("");setNewCatDesc("");},[]);
@@ -1020,7 +1021,6 @@ export default function App(){
             const totalGastos=rawTxns.filter(t=>t.category&&t.category!=="Reembolso").reduce((s,t)=>s+(t.brlValue!=null?t.brlValue:t.value),0);
             const totalReembolso=rawTxns.filter(t=>t.category==="Reembolso").reduce((s,t)=>s+(t.brlValue!=null?t.brlValue:t.value),0);
             const totalReceita=rawInc.reduce((s,i)=>s+i.value,0);
-            const isEditing=(id,field,type)=>editingCell&&editingCell.id===id&&editingCell.field===field&&editingCell.type===type;
             const cellInput=()=>(<input autoFocus value={editVal} onChange={e=>setEditVal(e.target.value)} onBlur={commitEdit} onKeyDown={e=>{if(e.key==="Enter")commitEdit();if(e.key==="Escape")cancelEdit();}} style={{...S.input,padding:"4px 8px",fontSize:11,width:"100%"}}/>);
             return(
             <div style={{...S.card,marginBottom:24}}>
@@ -1219,7 +1219,6 @@ export default function App(){
               <button onClick={deleteSelected} style={{...S.btn,background:C.redBg,color:"#E8575A",padding:"4px 14px",fontSize:11,border:"1px solid rgba(232,87,90,0.2)"}}>Excluir</button>
               <button onClick={()=>setSelectedTxns(new Set())} style={{...S.btn,background:C.bg2,color:C.t3,padding:"4px 14px",fontSize:11}}>Limpar</button>
             </div>)}
-            {(()=>{const isEditing=(id,field,type)=>editingCell&&editingCell.id===id&&editingCell.field===field&&editingCell.type===type;return(
             <div style={{...S.card,padding:0,overflow:"hidden"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                 <thead><tr style={{borderBottom:"1px solid "+C.border}}>
@@ -1244,7 +1243,7 @@ export default function App(){
                 </tr>))}</tbody>
               </table>
               {reviewFiltered.length>200&&<div style={{padding:16,textAlign:"center",fontSize:12,color:C.t4}}>{"Mostrando 200 de "+reviewFiltered.length}</div>}
-            </div>);})()}
+            </div>
           </div>)}
         </div>)}
 
