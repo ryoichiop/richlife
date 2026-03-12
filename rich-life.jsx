@@ -141,6 +141,45 @@ function parseValWithCurrency(raw) {
 
 // Exchange rate cache: {`${cur}-${dateStr}`: rate}
 const _rateCache = {};
+const _monthlyRateCache = {};
+
+// Get monthly average exchange rate (for BRL conversion on categorization)
+async function getMonthlyAvgRate(fromCur, monthKey) {
+  if(fromCur==="BRL") return 1;
+  const ck = `${fromCur}-${monthKey}`;
+  if(_monthlyRateCache[ck]) return _monthlyRateCache[ck];
+  const [mName,yy] = monthKey.split("/");
+  const mi = MONTH_NAMES.indexOf(mName);
+  const year = 2000+parseInt(yy);
+  const firstDay = `${year}-${String(mi+1).padStart(2,"0")}-01`;
+  const lastDay = mi===11 ? `${year+1}-01-01` : `${year}-${String(mi+2).padStart(2,"0")}-01`;
+  // Try BCB PTAX monthly average for USD
+  if(fromCur==="USD"){
+    try{
+      const url=`https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarPeriodo(dataInicial=@di,dataFinalCotacao=@df)?@di='${firstDay}'&@df='${lastDay}'&$format=json`;
+      const resp=await fetch(url);
+      if(resp.ok){
+        const data=await resp.json();
+        const cotacoes=data.value||[];
+        if(cotacoes.length>0){
+          const avg=cotacoes.reduce((s,c)=>s+c.cotacaoVenda,0)/cotacoes.length;
+          if(avg>0){_monthlyRateCache[ck]=Math.round(avg*10000)/10000;return _monthlyRateCache[ck];}
+        }
+      }
+    }catch(e){/* fallback */}
+  }
+  // For other currencies or if BCB fails, get rate for the 15th of the month (mid-month approximation)
+  const midDate = new Date(year, mi, 15);
+  try{
+    const rate = await getExchangeRate(fromCur, "BRL", midDate);
+    _monthlyRateCache[ck] = rate;
+    return rate;
+  }catch(e){
+    const fallback = {USD:5.50,EUR:6.00,GBP:7.00,JPY:0.037,CHF:6.30,AUD:3.60,CAD:4.00,ARS:0.005,CLP:0.006,MXN:0.30,COP:0.0013,PEN:1.45,UYU:0.13};
+    return fallback[fromCur]||1;
+  }
+}
+
 async function getExchangeRate(fromCur, toCur="BRL", date=null) {
   if(fromCur===toCur) return 1;
   const dateStr = date instanceof Date ? date.toISOString().slice(0,10) : (date || new Date().toISOString().slice(0,10));
@@ -232,7 +271,7 @@ const ANTHROPIC_HEADERS = {"Content-Type":"application/json","x-api-key":_ANTHRO
 async function loadPdfJs(){if(window.pdfjsLib)return window.pdfjsLib;return new Promise((resolve,reject)=>{const s=document.createElement("script");s.src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";s.onload=()=>{window.pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";resolve(window.pdfjsLib);};s.onerror=reject;document.head.appendChild(s);});}
 async function parsePdfFile(file){const pdfjsLib=await loadPdfJs();const buf=await file.arrayBuffer();const pdf=await pdfjsLib.getDocument({data:new Uint8Array(buf),cMapUrl:"https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/cmaps/",cMapPacked:true}).promise;let fullText="";for(let p=1;p<=pdf.numPages;p++){const page=await pdf.getPage(p);const content=await page.getTextContent();const items=content.items.filter(it=>it.str.trim());if(items.length===0)continue;const sorted=[...items].sort((a,b)=>b.transform[5]-a.transform[5]||a.transform[4]-b.transform[4]);const lines=[];let curLine=[],curY=null;for(const item of sorted){const y=item.transform[5];if(curY===null||Math.abs(y-curY)<=5){curLine.push(item);if(curY===null)curY=y}else{if(curLine.length)lines.push(curLine.sort((a,b)=>a.transform[4]-b.transform[4]));curLine=[item];curY=y;}}if(curLine.length)lines.push(curLine.sort((a,b)=>a.transform[4]-b.transform[4]));for(const line of lines){let lt="";for(let i=0;i<line.length;i++){if(i>0){const gap=line[i].transform[4]-(line[i-1].transform[4]+(line[i-1].width||0));lt+=gap>8?"  ":gap>2?" ":"";}lt+=line[i].str;}fullText+=lt+"\n";}fullText+="\n";}if(!fullText.trim()){fullText="";for(let p=1;p<=pdf.numPages;p++){const page=await pdf.getPage(p);const content=await page.getTextContent();fullText+=content.items.map(it=>it.str).join(" ")+"\n";}}console.log("[PDF] Extracted "+fullText.length+" chars from "+pdf.numPages+" pages");return fullText;}
 // Known card mappings: last 4 digits → source name
-const CARD_SOURCE_MAP={"1218":"Cartão Sicredi Maria","1119":"Cartão Sicredi Ryo","1911":"Cartão Sicredi Ryo"};
+const CARD_SOURCE_MAP={"1218":"Maria Crédito Sicredi","1119":"Ryo Crédito Sicredi","1911":"Ryo Crédito Sicredi"};
 function detectCardSource(text){
   // Look for known card number endings in the document text
   const sample=text.slice(0,5000);
@@ -733,7 +772,11 @@ export default function App(){
     // Deduplicate against existing txns and within the batch
     const foreignCount=res.filter(t=>t.currency&&t.currency!=="BRL").length;
     setTxns(p=>{const{unique,dupeCount}=deduplicateTxns(res,p);const msg=unique.length+" novas transações"+(dupeCount>0?" ("+dupeCount+" duplicadas removidas)":"")+(foreignCount>0?" · "+foreignCount+" em moeda estrangeira":"");if(unique.length>0||dupeCount>0){setUploadStatus({msg:"Pronto! "+msg+".",loading:false});}return[...p,...unique];});if(res.length>0){setView("review");}},[learnedPatterns]);
-  const updateCat=useCallback((id,cat)=>{const txn=txns.find(t=>t.id===id);if(txn&&cat&&!txn.confirmed){const pattern=extractLearnPattern(txn.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===cat))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:cat,createdAt:new Date().toISOString()}];});}setTxns(p=>p.map(t=>t.id===id?{...t,category:cat,confirmed:true}:t));setEditId(null);},[txns]);
+  const updateCat=useCallback((id,cat)=>{const txn=txns.find(t=>t.id===id);if(txn&&cat&&!txn.confirmed){const pattern=extractLearnPattern(txn.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===cat))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:cat,createdAt:new Date().toISOString()}];});}setTxns(p=>p.map(t=>t.id===id?{...t,category:cat,confirmed:true}:t));setEditId(null);
+    // Auto-convert non-BRL to BRL using monthly avg rate on categorization
+    if(txn&&txn.currency&&txn.currency!=="BRL"&&(!txn.exchangeRate||txn.exchangeRate===1)&&txn.monthKey){
+      (async()=>{try{const rate=await getMonthlyAvgRate(txn.currency,txn.monthKey);if(rate>0&&rate!==1){setTxns(p=>p.map(t=>t.id===id?{...t,exchangeRate:rate,brlValue:Math.round((t.originalValue||t.value)*rate*100)/100,_needsRateUpdate:undefined}:t));}}catch(e){}})();
+    }},[txns]);
   const startEdit=useCallback((id,field,type,currentVal)=>{setEditingCell({id,field,type});setEditVal(currentVal||"");},[]);
   const commitEdit=useCallback(()=>{if(!editingCell)return;const{id,field,type}=editingCell;const val=editVal;if(type==="txn"){setTxns(p=>p.map(t=>{if(t.id!==id)return t;const u={...t};if(field==="description")u.description=val;else if(field==="value"){const newVal=parseVal(val);const cur=editCurrency||t.currency||"BRL";u.originalValue=newVal;u.value=newVal;u.currency=cur;if(cur==="BRL"){u.brlValue=newVal;u.exchangeRate=1;}else{const rate=t.exchangeRate||(cur===t.currency?t.exchangeRate:null);if(rate&&cur===t.currency){u.brlValue=Math.round(newVal*rate*100)/100;}else{u.brlValue=newVal;u._needsRateUpdate=true;}}if(cur!==t.currency)u._needsRateUpdate=true;}else if(field==="source")u.source=val;else if(field==="category"){if(val&&!t.confirmed){const pattern=extractLearnPattern(t.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===val))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:val,createdAt:new Date().toISOString()}];});}u.category=val||null;u.confirmed=!!val;}else if(field==="date"){const d=parseDate(val);if(d){u.date=d;u.monthKey=getMonthKey(d);}}else if(field==="monthKey"){u.monthKey=val;}return u;}));}else if(type==="inc"){setIncome(p=>p.map(inc=>{if(inc.id!==id)return inc;const u={...inc};if(field==="desc")u.desc=val;else if(field==="value")u.value=parseVal(val);else if(field==="type")u.type=val;else if(field==="monthKey")u.monthKey=val;return u;}));}setEditingCell(null);setEditVal("");setEditCurrency("BRL");},[editingCell,editVal,editCurrency]);
   // Auto-fetch exchange rates for transactions that need them
@@ -768,13 +811,20 @@ export default function App(){
     // First: apply learned patterns silently
     if(learnedPatterns.length>0){let lc=0;setTxns(p=>p.map(t=>{if(t.category)return t;const learned=categorizeLearned(t.description,learnedPatterns);if(learned){lc++;return{...t,category:learned,confirmed:true};}return t;}));uncat=uncat.filter(t=>!categorizeLearned(t.description,learnedPatterns));if(uncat.length===0)return;}
     setAiLoading(true);try{const mapping=await aiRecategorizeAll(uncat,categories);const valid=new Set(catNames);const proposals=[];for(const[idx,cat]of Object.entries(mapping)){if(!valid.has(cat))continue;const tx=uncat[parseInt(idx)];if(!tx)continue;proposals.push({txnId:tx.id,description:tx.description,value:tx.value,category:cat});}setRecatResult(proposals);}catch(e){console.error(e);}setAiLoading(false);},[txns,categories,catNames,learnedPatterns]);
-  const acceptRecat=useCallback(()=>{if(!recatResult)return;setTxns(p=>{const n=[...p];for(const r of recatResult){const ri=n.findIndex(t=>t.id===r.txnId);if(ri>=0){n[ri]={...n[ri],category:r.category,confirmed:true};const pattern=extractLearnPattern(n[ri].description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===r.category))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:r.category,createdAt:new Date().toISOString()}];});}}return n;});setRecatResult(null);},[recatResult]);
+  const acceptRecat=useCallback(()=>{if(!recatResult)return;const foreignTxns=[];setTxns(p=>{const n=[...p];for(const r of recatResult){const ri=n.findIndex(t=>t.id===r.txnId);if(ri>=0){n[ri]={...n[ri],category:r.category,confirmed:true};if(n[ri].currency&&n[ri].currency!=="BRL"&&(!n[ri].exchangeRate||n[ri].exchangeRate===1)&&n[ri].monthKey)foreignTxns.push({id:n[ri].id,currency:n[ri].currency,monthKey:n[ri].monthKey});const pattern=extractLearnPattern(n[ri].description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===r.category))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:r.category,createdAt:new Date().toISOString()}];});}}return n;});setRecatResult(null);
+    if(foreignTxns.length>0){(async()=>{const updates={};for(const ft of foreignTxns){try{const rate=await getMonthlyAvgRate(ft.currency,ft.monthKey);if(rate>0&&rate!==1)updates[ft.id]={exchangeRate:rate};}catch(e){}}if(Object.keys(updates).length>0){setTxns(p=>p.map(t=>{const u=updates[t.id];if(!u)return t;return{...t,exchangeRate:u.exchangeRate,brlValue:Math.round((t.originalValue||t.value)*u.exchangeRate*100)/100,_needsRateUpdate:undefined};}));}})();}},[recatResult]);
   const rejectRecat=useCallback(()=>{setRecatResult(null);},[]);
   const addIncome=useCallback(()=>{const val=parseVal(incValue);if(!incMonth||val===0)return;setIncome(p=>[...p,{id:"inc-"+Date.now(),monthKey:incMonth,type:incType,value:val,desc:incDesc||incType}]);setIncValue("");setIncDesc("");setShowIncome(false);},[incMonth,incType,incValue,incDesc]);
   const removeIncome=useCallback((id)=>{setIncome(p=>p.filter(i=>i.id!==id));},[]);
   const addExpense=useCallback(()=>{const val=parseVal(expValue);if(!expMonth||val===0)return;const d=expDate?new Date(expDate+"T12:00:00"):new Date();const currency=expCurrency||"BRL";const isForeign=currency!=="BRL";setTxns(p=>[...p,{id:"man-"+Date.now(),date:d,description:expDesc||"Gasto manual",value:val,originalValue:val,currency,brlValue:isForeign?val:val,exchangeRate:isForeign?null:1,_needsRateUpdate:isForeign||undefined,monthKey:expMonth,category:expCat||"",confirmed:!!expCat,source:"Manual"}]);setExpValue("");setExpDesc("");setExpCat("");setExpDate("");setExpCurrency("BRL");setShowExpense(false);},[expMonth,expValue,expDesc,expCat,expDate,expCurrency]);
   const deleteTxn=useCallback((id)=>{setTxns(p=>p.filter(t=>t.id!==id));},[]);
-  const applyBulk=useCallback(()=>{if(!bulkAction||!bulkValue||selectedTxns.size===0)return;setTxns(p=>p.map(t=>{if(!selectedTxns.has(t.id))return t;if(bulkAction==="category"){const pattern=extractLearnPattern(t.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===bulkValue))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:bulkValue,createdAt:new Date().toISOString()}];});return{...t,category:bulkValue,confirmed:true};}if(bulkAction==="source")return{...t,source:bulkValue};if(bulkAction==="monthKey")return{...t,monthKey:bulkValue};if(bulkAction==="currency"){const cur=bulkValue;const u={...t,currency:cur,originalValue:t.originalValue||t.value};if(cur==="BRL"){u.brlValue=u.originalValue;u.exchangeRate=1;}else{u._needsRateUpdate=true;}return u;}return t;}));setSelectedTxns(new Set());setBulkAction(null);setBulkValue("");},[bulkAction,bulkValue,selectedTxns]);
+  const applyBulk=useCallback(()=>{if(!bulkAction||!bulkValue||selectedTxns.size===0)return;
+    // Collect non-BRL txns that need rate conversion when bulk-categorizing
+    const needsConversion=[];
+    setTxns(p=>p.map(t=>{if(!selectedTxns.has(t.id))return t;if(bulkAction==="category"){const pattern=extractLearnPattern(t.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===bulkValue))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:bulkValue,createdAt:new Date().toISOString()}];});if(t.currency&&t.currency!=="BRL"&&(!t.exchangeRate||t.exchangeRate===1)&&t.monthKey)needsConversion.push({id:t.id,currency:t.currency,monthKey:t.monthKey});return{...t,category:bulkValue,confirmed:true};}if(bulkAction==="source")return{...t,source:bulkValue};if(bulkAction==="monthKey")return{...t,monthKey:bulkValue};if(bulkAction==="currency"){const cur=bulkValue;const u={...t,currency:cur,originalValue:t.originalValue||t.value};if(cur==="BRL"){u.brlValue=u.originalValue;u.exchangeRate=1;}else{u._needsRateUpdate=true;}return u;}return t;}));setSelectedTxns(new Set());setBulkAction(null);setBulkValue("");
+    // Async: convert non-BRL transactions using monthly avg rate after bulk categorize
+    if(needsConversion.length>0){(async()=>{const updates={};for(const nc of needsConversion){try{const rate=await getMonthlyAvgRate(nc.currency,nc.monthKey);if(rate>0&&rate!==1)updates[nc.id]={exchangeRate:rate};}catch(e){}}if(Object.keys(updates).length>0){setTxns(p=>p.map(t=>{const u=updates[t.id];if(!u)return t;return{...t,exchangeRate:u.exchangeRate,brlValue:Math.round((t.originalValue||t.value)*u.exchangeRate*100)/100,_needsRateUpdate:undefined};}));}})();}
+  },[bulkAction,bulkValue,selectedTxns]);
   const deleteSelected=useCallback(()=>{if(selectedTxns.size===0)return;setTxns(p=>p.filter(t=>!selectedTxns.has(t.id)));setSelectedTxns(new Set());},[selectedTxns]);
   const fixAllData=useCallback(()=>{
     let srcCount=0,mkCount=0;
