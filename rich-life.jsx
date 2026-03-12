@@ -521,6 +521,12 @@ export default function App(){
   const [income,setIncome]=useState(INIT_INCOME);
   const [budget,setBudget]=useState(INIT_BUDGET);
   const [investments,setInvestments]=useState([]);
+  // Undo/Redo history
+  const MAX_HISTORY=30;
+  const [txnHistory,setTxnHistory]=useState([]);
+  const [txnFuture,setTxnFuture]=useState([]);
+  const [invHistory,setInvHistory]=useState([]);
+  const [invFuture,setInvFuture]=useState([]);
   const [files,setFiles]=useState([]);
   const [fMonth,setFMonth]=useState("all");
   const [editId,setEditId]=useState(null);
@@ -655,6 +661,8 @@ export default function App(){
         const d=payload.new?.data;
         if(!d||d._clientId===CLIENT_ID)return;
         isRemoteUpdate.current=true;
+        // Clear undo/redo history on remote sync to avoid conflicts
+        setTxnHistory([]);setTxnFuture([]);setInvHistory([]);setInvFuture([]);
         if(d.categories)setCategories(d.categories);
         if(d.txns)setTxns(deserializeTxns(d.txns));
         if(d.income)setIncome(d.income);
@@ -771,14 +779,14 @@ export default function App(){
     for(const t of res){if(!t.category){const learned=categorizeLearned(t.description,learnedPatterns);if(learned){t.category=learned;t.confirmed=true;}}}
     // Deduplicate against existing txns and within the batch
     const foreignCount=res.filter(t=>t.currency&&t.currency!=="BRL").length;
-    setTxns(p=>{const{unique,dupeCount}=deduplicateTxns(res,p);const msg=unique.length+" novas transações"+(dupeCount>0?" ("+dupeCount+" duplicadas removidas)":"")+(foreignCount>0?" · "+foreignCount+" em moeda estrangeira":"");if(unique.length>0||dupeCount>0){setUploadStatus({msg:"Pronto! "+msg+".",loading:false});}return[...p,...unique];});if(res.length>0){setView("review");}},[learnedPatterns]);
-  const updateCat=useCallback((id,cat)=>{const txn=txns.find(t=>t.id===id);if(txn&&cat&&!txn.confirmed){const pattern=extractLearnPattern(txn.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===cat))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:cat,createdAt:new Date().toISOString()}];});}setTxns(p=>p.map(t=>t.id===id?{...t,category:cat,confirmed:true}:t));setEditId(null);
+    pushTxnHistory();setTxns(p=>{const{unique,dupeCount}=deduplicateTxns(res,p);const msg=unique.length+" novas transações"+(dupeCount>0?" ("+dupeCount+" duplicadas removidas)":"")+(foreignCount>0?" · "+foreignCount+" em moeda estrangeira":"");if(unique.length>0||dupeCount>0){setUploadStatus({msg:"Pronto! "+msg+".",loading:false});}return[...p,...unique];});if(res.length>0){setView("review");}},[learnedPatterns]);
+  const updateCat=useCallback((id,cat)=>{pushTxnHistory();const txn=txns.find(t=>t.id===id);if(txn&&cat&&!txn.confirmed){const pattern=extractLearnPattern(txn.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===cat))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:cat,createdAt:new Date().toISOString()}];});}setTxns(p=>p.map(t=>t.id===id?{...t,category:cat,confirmed:true}:t));setEditId(null);
     // Auto-convert non-BRL to BRL using monthly avg rate on categorization
     if(txn&&txn.currency&&txn.currency!=="BRL"&&(!txn.exchangeRate||txn.exchangeRate===1)&&txn.monthKey){
       (async()=>{try{const rate=await getMonthlyAvgRate(txn.currency,txn.monthKey);if(rate>0&&rate!==1){setTxns(p=>p.map(t=>t.id===id?{...t,exchangeRate:rate,brlValue:Math.round((t.originalValue||t.value)*rate*100)/100,_needsRateUpdate:undefined}:t));}}catch(e){}})();
     }},[txns]);
   const startEdit=useCallback((id,field,type,currentVal)=>{setEditingCell({id,field,type});setEditVal(currentVal||"");},[]);
-  const commitEdit=useCallback(()=>{if(!editingCell)return;const{id,field,type}=editingCell;const val=editVal;if(type==="txn"){setTxns(p=>p.map(t=>{if(t.id!==id)return t;const u={...t};if(field==="description")u.description=val;else if(field==="value"){const newVal=parseVal(val);const cur=editCurrency||t.currency||"BRL";u.originalValue=newVal;u.value=newVal;u.currency=cur;if(cur==="BRL"){u.brlValue=newVal;u.exchangeRate=1;}else{const rate=t.exchangeRate||(cur===t.currency?t.exchangeRate:null);if(rate&&cur===t.currency){u.brlValue=Math.round(newVal*rate*100)/100;}else{u.brlValue=newVal;u._needsRateUpdate=true;}}if(cur!==t.currency)u._needsRateUpdate=true;}else if(field==="source")u.source=val;else if(field==="category"){if(val&&!t.confirmed){const pattern=extractLearnPattern(t.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===val))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:val,createdAt:new Date().toISOString()}];});}u.category=val||null;u.confirmed=!!val;}else if(field==="date"){const d=parseDate(val);if(d){u.date=d;u.monthKey=getMonthKey(d);}}else if(field==="monthKey"){u.monthKey=val;}return u;}));}else if(type==="inc"){setIncome(p=>p.map(inc=>{if(inc.id!==id)return inc;const u={...inc};if(field==="desc")u.desc=val;else if(field==="value")u.value=parseVal(val);else if(field==="type")u.type=val;else if(field==="monthKey")u.monthKey=val;return u;}));}setEditingCell(null);setEditVal("");setEditCurrency("BRL");},[editingCell,editVal,editCurrency]);
+  const commitEdit=useCallback(()=>{if(!editingCell)return;const{id,field,type}=editingCell;const val=editVal;if(type==="txn"){pushTxnHistory();setTxns(p=>p.map(t=>{if(t.id!==id)return t;const u={...t};if(field==="description")u.description=val;else if(field==="value"){const newVal=parseVal(val);const cur=editCurrency||t.currency||"BRL";u.originalValue=newVal;u.value=newVal;u.currency=cur;if(cur==="BRL"){u.brlValue=newVal;u.exchangeRate=1;}else{const rate=t.exchangeRate||(cur===t.currency?t.exchangeRate:null);if(rate&&cur===t.currency){u.brlValue=Math.round(newVal*rate*100)/100;}else{u.brlValue=newVal;u._needsRateUpdate=true;}}if(cur!==t.currency)u._needsRateUpdate=true;}else if(field==="source")u.source=val;else if(field==="category"){if(val&&!t.confirmed){const pattern=extractLearnPattern(t.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===val))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:val,createdAt:new Date().toISOString()}];});}u.category=val||null;u.confirmed=!!val;}else if(field==="date"){const d=parseDate(val);if(d){u.date=d;u.monthKey=getMonthKey(d);}}else if(field==="monthKey"){u.monthKey=val;}return u;}));}else if(type==="inc"){setIncome(p=>p.map(inc=>{if(inc.id!==id)return inc;const u={...inc};if(field==="desc")u.desc=val;else if(field==="value")u.value=parseVal(val);else if(field==="type")u.type=val;else if(field==="monthKey")u.monthKey=val;return u;}));}setEditingCell(null);setEditVal("");setEditCurrency("BRL");},[editingCell,editVal,editCurrency]);
   // Auto-fetch exchange rates for transactions that need them
   useEffect(()=>{
     const needsRate=txns.filter(t=>t._needsRateUpdate||(!t.exchangeRate&&t.currency&&t.currency!=="BRL"));
@@ -802,8 +810,17 @@ export default function App(){
   },[txns.filter(t=>t._needsRateUpdate||(!t.exchangeRate&&t.currency&&t.currency!=="BRL")).length]);
   const cancelEdit=useCallback(()=>{setEditingCell(null);setEditVal("");setEditCurrency("BRL");},[]);
   const isEditing=useCallback((id,field,type)=>editingCell&&editingCell.id===id&&editingCell.field===field&&editingCell.type===type,[editingCell]);
+  // Undo/Redo helpers
+  const pushTxnHistory=useCallback(()=>{setTxnHistory(h=>[...h.slice(-(MAX_HISTORY-1)),txns]);setTxnFuture([]);},[txns]);
+  const pushInvHistory=useCallback(()=>{setInvHistory(h=>[...h.slice(-(MAX_HISTORY-1)),investments]);setInvFuture([]);},[investments]);
+  const undoTxns=useCallback(()=>{if(txnHistory.length===0)return;const prev=txnHistory[txnHistory.length-1];setTxnFuture(f=>[...f,txns]);setTxns(prev);setTxnHistory(h=>h.slice(0,-1));},[txnHistory,txns]);
+  const redoTxns=useCallback(()=>{if(txnFuture.length===0)return;const next=txnFuture[txnFuture.length-1];setTxnHistory(h=>[...h,txns]);setTxns(next);setTxnFuture(f=>f.slice(0,-1));},[txnFuture,txns]);
+  const undoInv=useCallback(()=>{if(invHistory.length===0)return;const prev=invHistory[invHistory.length-1];setInvFuture(f=>[...f,investments]);setInvestments(prev);setInvHistory(h=>h.slice(0,-1));},[invHistory,investments]);
+  const redoInv=useCallback(()=>{if(invFuture.length===0)return;const next=invFuture[invFuture.length-1];setInvHistory(h=>[...h,investments]);setInvestments(next);setInvFuture(f=>f.slice(0,-1));},[invFuture,investments]);
+  // Undo/Redo keyboard shortcuts
+  useEffect(()=>{const handler=(e)=>{if((e.ctrlKey||e.metaKey)&&e.key==="z"&&!e.shiftKey){e.preventDefault();if(view==="review")undoTxns();else if(view==="investments")undoInv();}else if((e.ctrlKey||e.metaKey)&&(e.key==="y"||(e.key==="z"&&e.shiftKey))){e.preventDefault();if(view==="review")redoTxns();else if(view==="investments")redoInv();}};window.addEventListener("keydown",handler);return()=>window.removeEventListener("keydown",handler);},[view,undoTxns,redoTxns,undoInv,redoInv]);
   const handleCreateCat=useCallback(async()=>{if(!newCatName.trim()||!newCatDesc.trim())return;const name=newCatName.trim(),cat={name,color:newCatColor,desc:newCatDesc.trim()};setCategories(prev=>[...prev,cat]);const uncat=txns.filter(t=>!t.category);if(uncat.length>0){setAiLoading(true);try{const indices=await aiCategorize(uncat,name,newCatDesc.trim(),[...categories,cat]);setAiResult({indices,catName:name,txnIds:indices.map(i=>uncat[i]?.id).filter(Boolean)});}catch(e){setAiResult({indices:[],catName:name,txnIds:[],error:true});}setAiLoading(false);}else{setShowNewCat(false);setNewCatName("");setNewCatDesc("");}},[newCatName,newCatDesc,newCatColor,categories,txns]);
-  const acceptAi=useCallback(()=>{if(!aiResult)return;setTxns(p=>p.map(t=>aiResult.txnIds.includes(t.id)?{...t,category:aiResult.catName,confirmed:true}:t));setAiResult(null);setShowNewCat(false);setNewCatName("");setNewCatDesc("");},[aiResult]);
+  const acceptAi=useCallback(()=>{if(!aiResult)return;pushTxnHistory();setTxns(p=>p.map(t=>aiResult.txnIds.includes(t.id)?{...t,category:aiResult.catName,confirmed:true}:t));setAiResult(null);setShowNewCat(false);setNewCatName("");setNewCatDesc("");},[aiResult]);
   const rejectAi=useCallback(()=>{setAiResult(null);setShowNewCat(false);setNewCatName("");setNewCatDesc("");},[]);
   const confirmDeleteCat=useCallback(()=>{if(!deleteCat)return;setCategories(p=>p.filter(c=>c.name!==deleteCat));setTxns(p=>p.map(t=>t.category===deleteCat?{...t,category:null,confirmed:false}:t));setDeleteCat(null);},[deleteCat]);
   const handleEditCatSave=useCallback(()=>{if(!editCat||!editCatDesc.trim())return;setCategories(p=>p.map(c=>c.name===editCat?{...c,desc:editCatDesc.trim()}:c));setEditCat(null);},[editCat,editCatDesc]);
@@ -811,22 +828,22 @@ export default function App(){
     // First: apply learned patterns silently
     if(learnedPatterns.length>0){let lc=0;setTxns(p=>p.map(t=>{if(t.category)return t;const learned=categorizeLearned(t.description,learnedPatterns);if(learned){lc++;return{...t,category:learned,confirmed:true};}return t;}));uncat=uncat.filter(t=>!categorizeLearned(t.description,learnedPatterns));if(uncat.length===0)return;}
     setAiLoading(true);try{const mapping=await aiRecategorizeAll(uncat,categories);const valid=new Set(catNames);const proposals=[];for(const[idx,cat]of Object.entries(mapping)){if(!valid.has(cat))continue;const tx=uncat[parseInt(idx)];if(!tx)continue;proposals.push({txnId:tx.id,description:tx.description,value:tx.value,category:cat});}setRecatResult(proposals);}catch(e){console.error(e);}setAiLoading(false);},[txns,categories,catNames,learnedPatterns]);
-  const acceptRecat=useCallback(()=>{if(!recatResult)return;const foreignTxns=[];setTxns(p=>{const n=[...p];for(const r of recatResult){const ri=n.findIndex(t=>t.id===r.txnId);if(ri>=0){n[ri]={...n[ri],category:r.category,confirmed:true};if(n[ri].currency&&n[ri].currency!=="BRL"&&(!n[ri].exchangeRate||n[ri].exchangeRate===1)&&n[ri].monthKey)foreignTxns.push({id:n[ri].id,currency:n[ri].currency,monthKey:n[ri].monthKey});const pattern=extractLearnPattern(n[ri].description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===r.category))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:r.category,createdAt:new Date().toISOString()}];});}}return n;});setRecatResult(null);
+  const acceptRecat=useCallback(()=>{if(!recatResult)return;pushTxnHistory();const foreignTxns=[];setTxns(p=>{const n=[...p];for(const r of recatResult){const ri=n.findIndex(t=>t.id===r.txnId);if(ri>=0){n[ri]={...n[ri],category:r.category,confirmed:true};if(n[ri].currency&&n[ri].currency!=="BRL"&&(!n[ri].exchangeRate||n[ri].exchangeRate===1)&&n[ri].monthKey)foreignTxns.push({id:n[ri].id,currency:n[ri].currency,monthKey:n[ri].monthKey});const pattern=extractLearnPattern(n[ri].description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===r.category))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:r.category,createdAt:new Date().toISOString()}];});}}return n;});setRecatResult(null);
     if(foreignTxns.length>0){(async()=>{const updates={};for(const ft of foreignTxns){try{const rate=await getMonthlyAvgRate(ft.currency,ft.monthKey);if(rate>0&&rate!==1)updates[ft.id]={exchangeRate:rate};}catch(e){}}if(Object.keys(updates).length>0){setTxns(p=>p.map(t=>{const u=updates[t.id];if(!u)return t;return{...t,exchangeRate:u.exchangeRate,brlValue:Math.round((t.originalValue||t.value)*u.exchangeRate*100)/100,_needsRateUpdate:undefined};}));}})();}},[recatResult]);
   const rejectRecat=useCallback(()=>{setRecatResult(null);},[]);
   const addIncome=useCallback(()=>{const val=parseVal(incValue);if(!incMonth||val===0)return;setIncome(p=>[...p,{id:"inc-"+Date.now(),monthKey:incMonth,type:incType,value:val,desc:incDesc||incType}]);setIncValue("");setIncDesc("");setShowIncome(false);},[incMonth,incType,incValue,incDesc]);
   const removeIncome=useCallback((id)=>{setIncome(p=>p.filter(i=>i.id!==id));},[]);
   const addExpense=useCallback(()=>{const val=parseVal(expValue);if(!expMonth||val===0)return;const d=expDate?new Date(expDate+"T12:00:00"):new Date();const currency=expCurrency||"BRL";const isForeign=currency!=="BRL";setTxns(p=>[...p,{id:"man-"+Date.now(),date:d,description:expDesc||"Gasto manual",value:val,originalValue:val,currency,brlValue:isForeign?val:val,exchangeRate:isForeign?null:1,_needsRateUpdate:isForeign||undefined,monthKey:expMonth,category:expCat||"",confirmed:!!expCat,source:"Manual"}]);setExpValue("");setExpDesc("");setExpCat("");setExpDate("");setExpCurrency("BRL");setShowExpense(false);},[expMonth,expValue,expDesc,expCat,expDate,expCurrency]);
-  const deleteTxn=useCallback((id)=>{setTxns(p=>p.filter(t=>t.id!==id));},[]);
-  const applyBulk=useCallback(()=>{if(!bulkAction||!bulkValue||selectedTxns.size===0)return;
+  const deleteTxn=useCallback((id)=>{pushTxnHistory();setTxns(p=>p.filter(t=>t.id!==id));},[pushTxnHistory]);
+  const applyBulk=useCallback(()=>{if(!bulkAction||!bulkValue||selectedTxns.size===0)return;pushTxnHistory();
     // Collect non-BRL txns that need rate conversion when bulk-categorizing
     const needsConversion=[];
     setTxns(p=>p.map(t=>{if(!selectedTxns.has(t.id))return t;if(bulkAction==="category"){const pattern=extractLearnPattern(t.description);if(pattern)setLearnedPatterns(prev=>{if(prev.some(lp=>lp.pattern===pattern&&lp.category===bulkValue))return prev;return[...prev.filter(lp=>lp.pattern!==pattern),{pattern,category:bulkValue,createdAt:new Date().toISOString()}];});if(t.currency&&t.currency!=="BRL"&&(!t.exchangeRate||t.exchangeRate===1)&&t.monthKey)needsConversion.push({id:t.id,currency:t.currency,monthKey:t.monthKey});return{...t,category:bulkValue,confirmed:true};}if(bulkAction==="source")return{...t,source:bulkValue};if(bulkAction==="monthKey")return{...t,monthKey:bulkValue};if(bulkAction==="currency"){const cur=bulkValue;const u={...t,currency:cur,originalValue:t.originalValue||t.value};if(cur==="BRL"){u.brlValue=u.originalValue;u.exchangeRate=1;}else{u._needsRateUpdate=true;}return u;}return t;}));setSelectedTxns(new Set());setBulkAction(null);setBulkValue("");
     // Async: convert non-BRL transactions using monthly avg rate after bulk categorize
     if(needsConversion.length>0){(async()=>{const updates={};for(const nc of needsConversion){try{const rate=await getMonthlyAvgRate(nc.currency,nc.monthKey);if(rate>0&&rate!==1)updates[nc.id]={exchangeRate:rate};}catch(e){}}if(Object.keys(updates).length>0){setTxns(p=>p.map(t=>{const u=updates[t.id];if(!u)return t;return{...t,exchangeRate:u.exchangeRate,brlValue:Math.round((t.originalValue||t.value)*u.exchangeRate*100)/100,_needsRateUpdate:undefined};}));}})();}
   },[bulkAction,bulkValue,selectedTxns]);
-  const deleteSelected=useCallback(()=>{if(selectedTxns.size===0)return;setTxns(p=>p.filter(t=>!selectedTxns.has(t.id)));setSelectedTxns(new Set());},[selectedTxns]);
-  const fixAllData=useCallback(()=>{
+  const deleteSelected=useCallback(()=>{if(selectedTxns.size===0)return;pushTxnHistory();setTxns(p=>p.filter(t=>!selectedTxns.has(t.id)));setSelectedTxns(new Set());},[selectedTxns,pushTxnHistory]);
+  const fixAllData=useCallback(()=>{pushTxnHistory();
     let srcCount=0,mkCount=0;
     setTxns(p=>{
       // 1. Fix sources
@@ -871,6 +888,7 @@ export default function App(){
   // Investment handlers
   const saveInvestment=()=>{
     const val=parseVal(invDraft.value);if(!invDraft.monthKey||val===0)return;
+    pushInvHistory();
     let rm=parseFloat(invDraft.rate)||0;
     if(invDraft.tipo==="fixa"){rm=invDraft.rateMode==="year"?Math.pow(1+rm/100,1/12)-1:rm/100;}
     if(editInvId){
@@ -887,9 +905,9 @@ export default function App(){
     setInvDraft({value:String(inv.value),tipo:inv.tipo,desc:inv.desc,rate:inv.tipo==="fixa"?ratePercent.toFixed(4):"",rateMode:"month",monthKey:inv.monthKey});
     setEditInvId(inv.id);setShowNewInv(true);
   };
-  const removeInvestment=(id)=>setInvestments(p=>p.filter(i=>i.id!==id));
+  const removeInvestment=(id)=>{pushInvHistory();setInvestments(p=>p.filter(i=>i.id!==id));};
   const setInvYield=(invId,mk,val)=>{
-    setInvestments(p=>p.map(inv=>inv.id!==invId?inv:{...inv,yields:{...inv.yields,[mk]:parseFloat(val)||0}}));
+    pushInvHistory();setInvestments(p=>p.map(inv=>inv.id!==invId?inv:{...inv,yields:{...inv.yields,[mk]:parseFloat(val)||0}}));
   };
 
   // Compute investment timeline
@@ -1237,8 +1255,8 @@ export default function App(){
         </div>)}
 
         {/* ═══ REVIEW ═══ */}
-        {view==="review"&&(<div>
-          <div style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap",alignItems:"center"}}>
+        {view==="review"&&(<div style={{maxHeight:"calc(100vh - 90px)",overflowY:"auto",position:"relative"}}>
+          <div style={{display:"flex",gap:10,marginBottom:0,flexWrap:"wrap",alignItems:"center",position:"sticky",top:0,zIndex:12,background:C.bg,paddingBottom:12,paddingTop:4}}>
             <div style={{display:"flex",borderRadius:10,overflow:"hidden",border:"1px solid "+C.cardBorder}}>
               <button onClick={()=>{setReviewShowAll(false);setSelectedTxns(new Set());}} style={{padding:"6px 14px",fontSize:12,fontWeight:600,border:"none",cursor:"pointer",background:!reviewShowAll?"#2A9D8F":"transparent",color:!reviewShowAll?"#fff":C.t3,fontFamily:"inherit"}}>Pendentes ({uncat})</button>
               <button onClick={()=>{setReviewShowAll(true);setSelectedTxns(new Set());}} style={{padding:"6px 14px",fontSize:12,fontWeight:600,border:"none",cursor:"pointer",background:reviewShowAll?"#6C63FF":"transparent",color:reviewShowAll?"#fff":C.t3,fontFamily:"inherit"}}>Todos ({txns.length})</button>
@@ -1252,10 +1270,13 @@ export default function App(){
             {!reviewShowAll&&uncat>0&&<button onClick={handleAiRecat} disabled={aiLoading} style={{...S.btn,background:C.purpleBg,color:"#6C63FF",border:"1px solid rgba(108,99,255,0.2)",fontSize:12,padding:"6px 14px",opacity:aiLoading?0.5:1}}>{aiLoading?"⏳ ...":"✦ IA"}</button>}
             <button onClick={()=>{setExpMonth(nowMK);setShowExpense(true);}} style={{...S.btn,background:C.greenBg,color:"#2A9D8F",border:"1px solid rgba(42,157,143,0.25)",fontSize:12,padding:"6px 14px"}}>+ Gasto</button>
             <button onClick={()=>{const r=fixAllData();setUploadStatus({loading:false,msg:"Corrigido! "+r.mkCount+" mês(es), "+r.srcCount+" fonte(s)."});setTimeout(()=>setUploadStatus(null),4000);}} style={{...S.btn,background:C.bg2,color:C.t3,border:"1px solid "+C.cardBorder,fontSize:11,padding:"5px 12px"}} title="Recalcula meses, corrige fontes e normaliza parcelas">↻ Corrigir dados</button>
+            <button onClick={undoTxns} disabled={txnHistory.length===0} style={{...S.btn,background:C.bg2,color:txnHistory.length>0?C.t2:C.t4,border:"1px solid "+C.cardBorder,fontSize:11,padding:"5px 10px",opacity:txnHistory.length>0?1:0.4}} title="Desfazer (Ctrl+Z)">↩</button>
+            <button onClick={redoTxns} disabled={txnFuture.length===0} style={{...S.btn,background:C.bg2,color:txnFuture.length>0?C.t2:C.t4,border:"1px solid "+C.cardBorder,fontSize:11,padding:"5px 10px",opacity:txnFuture.length>0?1:0.4}} title="Refazer (Ctrl+Shift+Z)">↪</button>
             <div style={{marginLeft:"auto",fontSize:11,fontFamily:"'Space Mono',monospace",color:C.t4}}>{reviewFiltered.length} itens</div>
           </div>
           {reviewFiltered.length===0?(<div style={{textAlign:"center",padding:"80px 0"}}><div style={{fontSize:48,marginBottom:16,opacity:0.15}}>✓</div><div style={{fontSize:18,fontWeight:600,marginBottom:8,color:"#2A9D8F"}}>{reviewShowAll?"Nenhuma transação encontrada.":"Tudo categorizado!"}</div><div style={{fontSize:13,color:C.t3}}>{reviewShowAll?"Use os filtros ou faça upload de novos documentos.":"Nenhuma transação pendente."}</div>{!reviewShowAll&&<button onClick={()=>setView("upload")} style={{...S.btn,background:C.greenBg,color:"#2A9D8F",marginTop:16}}>Upload</button>}</div>):(<div>
-            {selectedTxns.size>0&&(<div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12,padding:"10px 16px",background:C.purpleBg,borderRadius:12,flexWrap:"wrap"}}>
+            {selectedTxns.size>0&&(<div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12,padding:"10px 16px",background:C.purpleBg,borderRadius:12,flexWrap:"wrap",position:"sticky",top:0,zIndex:11}}>
+
               <span style={{fontSize:12,fontWeight:600,color:"#6C63FF"}}>{selectedTxns.size} selecionado{selectedTxns.size>1?"s":""}</span>
               <select value={bulkAction||""} onChange={e=>{setBulkAction(e.target.value||null);setBulkValue("");}} style={{...S.input,width:"auto",padding:"4px 10px",fontSize:11}}>
                 <option value="">Ação em lote...</option>
@@ -1274,7 +1295,7 @@ export default function App(){
             </div>)}
             <div style={{...S.card,padding:0,overflow:"hidden"}}>
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                <thead><tr style={{borderBottom:"1px solid "+C.border}}>
+                <thead style={{position:"sticky",top:0,zIndex:5}}><tr style={{borderBottom:"1px solid "+C.border,background:C.bg}}>
                   <th style={{...S.th,padding:"8px 8px",width:36}}><input type="checkbox" checked={reviewFiltered.slice(0,200).length>0&&reviewFiltered.slice(0,200).every(t=>selectedTxns.has(t.id))} onChange={e=>{const visible=reviewFiltered.slice(0,200);if(e.target.checked){setSelectedTxns(prev=>{const n=new Set(prev);visible.forEach(t=>n.add(t.id));return n;});}else{setSelectedTxns(prev=>{const n=new Set(prev);visible.forEach(t=>n.delete(t.id));return n;});}}} style={{cursor:"pointer"}}/></th>
                   <SortTh label="Data" col="date" sort={reviewSort} setSort={setReviewSort}/>
                   <SortTh label="Descrição" col="description" sort={reviewSort} setSort={setReviewSort}/>
@@ -1304,7 +1325,11 @@ export default function App(){
         {view==="investments"&&(<div>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:24}}>
             <div><div style={{fontSize:20,fontWeight:700}}>Investimentos</div><div style={{fontSize:13,color:C.t3,marginTop:4}}>Acompanhe seus investimentos e rendimentos mês a mês.</div></div>
-            <button onClick={()=>{setInvDraft({value:"",tipo:"fixa",desc:"",rate:"",rateMode:"year",monthKey:""});setEditInvId(null);setShowNewInv(true)}} style={{...S.btn,background:C.purple,color:"#fff"}}>+ Novo Investimento</button>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <button onClick={undoInv} disabled={invHistory.length===0} style={{...S.btn,background:C.bg2,color:invHistory.length>0?C.t2:C.t4,border:"1px solid "+C.cardBorder,fontSize:11,padding:"5px 10px",opacity:invHistory.length>0?1:0.4}} title="Desfazer (Ctrl+Z)">↩</button>
+              <button onClick={redoInv} disabled={invFuture.length===0} style={{...S.btn,background:C.bg2,color:invFuture.length>0?C.t2:C.t4,border:"1px solid "+C.cardBorder,fontSize:11,padding:"5px 10px",opacity:invFuture.length>0?1:0.4}} title="Refazer (Ctrl+Shift+Z)">↪</button>
+              <button onClick={()=>{setInvDraft({value:"",tipo:"fixa",desc:"",rate:"",rateMode:"year",monthKey:""});setEditInvId(null);setShowNewInv(true)}} style={{...S.btn,background:C.purple,color:"#fff"}}>+ Novo Investimento</button>
+            </div>
           </div>
 
           {investments.length===0?(<div style={{textAlign:"center",padding:"80px 0"}}><div style={{fontSize:48,marginBottom:16,opacity:0.12}}>📈</div><div style={{fontSize:16,fontWeight:600,color:C.t3}}>Nenhum investimento cadastrado</div><div style={{fontSize:13,color:C.t4,marginTop:6}}>Adicione seu primeiro investimento para acompanhar os rendimentos.</div></div>):(
