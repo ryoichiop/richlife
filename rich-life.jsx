@@ -462,7 +462,7 @@ const _SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 const supabase = _SB_URL && _SB_KEY ? createClient(_SB_URL, _SB_KEY) : null;
 const CLIENT_ID = Math.random().toString(36).slice(2, 10);
 
-// Storage: Supabase cloud + localStorage (use most recent)
+// Storage: Supabase cloud + localStorage (always prefer the most complete data)
 if (typeof window !== "undefined") {
   window.storage = {
     get: async (key) => {
@@ -479,32 +479,46 @@ if (typeof window !== "undefined") {
         const raw = localStorage.getItem(key);
         if (raw) localData = JSON.parse(raw);
       } catch(e) { /* no local data */ }
-      // If only one source has data, use it
-      if (cloudData && !localData) return { value: JSON.stringify(cloudData) };
-      if (!cloudData && localData) return { value: JSON.stringify(localData) };
-      if (!cloudData && !localData) return null;
-      // Both exist: compare _savedAt timestamps, fall back to txn count
-      const cloudTs = cloudData._savedAt ? new Date(cloudData._savedAt).getTime() : 0;
-      const localTs = localData._savedAt ? new Date(localData._savedAt).getTime() : 0;
-      if (cloudTs > 0 || localTs > 0) {
-        const winner = cloudTs >= localTs ? cloudData : localData;
-        // Sync the winner to the other store
-        if (cloudTs < localTs && supabase) {
-          localData._clientId = CLIENT_ID;
-          supabase.from('app_state').upsert({ id: key, data: localData, updated_at: new Date().toISOString() }).catch(()=>{});
-        }
-        return { value: JSON.stringify(winner) };
+      // If only one source has data, use it (and sync to other)
+      if (cloudData && !localData) {
+        try { localStorage.setItem(key, JSON.stringify(cloudData)); } catch(e) {}
+        return { value: JSON.stringify(cloudData) };
       }
-      // No timestamps: use whichever has more transactions
+      if (!cloudData && localData) {
+        if (supabase) { localData._clientId = CLIENT_ID; supabase.from('app_state').upsert({ id: key, data: localData, updated_at: new Date().toISOString() }).catch(()=>{}); }
+        return { value: JSON.stringify(localData) };
+      }
+      if (!cloudData && !localData) return null;
+      // Both exist: ALWAYS compare transaction count as primary metric
       const cloudTxns = Array.isArray(cloudData.txns) ? cloudData.txns.length : 0;
       const localTxns = Array.isArray(localData.txns) ? localData.txns.length : 0;
-      const best = localTxns >= cloudTxns ? localData : cloudData;
-      // Sync winner up
-      if (localTxns >= cloudTxns && supabase) {
+      // Count categorized txns as additional quality signal
+      const cloudCat = cloudData.txns ? cloudData.txns.filter(t=>t.confirmed).length : 0;
+      const localCat = localData.txns ? localData.txns.filter(t=>t.confirmed).length : 0;
+      // If one has significantly more data (>10% more txns), prefer it regardless of timestamp
+      const diffRatio = Math.max(cloudTxns, localTxns) > 0 ? Math.abs(cloudTxns - localTxns) / Math.max(cloudTxns, localTxns) : 0;
+      let winner;
+      if (diffRatio > 0.1) {
+        // Significant difference: prefer the one with more transactions
+        winner = localTxns > cloudTxns ? localData : cloudData;
+      } else if (localCat !== cloudCat) {
+        // Similar count but different categorization: prefer more categorized
+        winner = localCat >= cloudCat ? localData : cloudData;
+      } else {
+        // Very similar: use timestamps
+        const cloudTs = cloudData._savedAt ? new Date(cloudData._savedAt).getTime() : 0;
+        const localTs = localData._savedAt ? new Date(localData._savedAt).getTime() : 0;
+        winner = localTs > cloudTs ? localData : (cloudTs > localTs ? cloudData : localData);
+      }
+      // Sync winner to both stores
+      if (winner === localData && supabase) {
         localData._clientId = CLIENT_ID;
         supabase.from('app_state').upsert({ id: key, data: localData, updated_at: new Date().toISOString() }).catch(()=>{});
+      } else if (winner === cloudData) {
+        try { localStorage.setItem(key, JSON.stringify(cloudData)); } catch(e) {}
       }
-      return { value: JSON.stringify(best) };
+      console.log('[Sync] cloud:', cloudTxns, 'txns (' + cloudCat + ' cat), local:', localTxns, 'txns (' + localCat + ' cat), winner:', winner === localData ? 'LOCAL' : 'CLOUD');
+      return { value: JSON.stringify(winner) };
     },
     set: async (key, val) => {
       // Inject timestamp
