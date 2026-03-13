@@ -239,7 +239,44 @@ function getMonthKey(d){if(!d)return null;return MONTH_NAMES[d.getMonth()]+"/"+S
 function extractLearnPattern(desc){if(!desc)return null;let s=String(desc).trim().toLowerCase();s=s.replace(/\s+[\d*#]{4,}$/g,"");s=s.replace(/\s+\d{2}\/\d{2}(\/\d{2,4})?$/g,"");s=s.replace(/\s+\d+\/\d+$/g,"");s=s.replace(/\s+/g," ").trim();return s.length>=3?s:null;}
 function categorizeLearned(desc,patterns){if(!desc||!patterns||patterns.length===0)return null;const lower=String(desc).trim().toLowerCase();for(const p of patterns){if(lower===p.pattern)return p.category;}for(const p of patterns){if(lower.includes(p.pattern)||p.pattern.includes(lower))return p.category;}return null;}
 
-function extractTxns(rows,fn){if(!rows||rows.length<2)return[];const h=rows[0].map(x=>String(x||"").toLowerCase().trim());let di=-1,de=-1,vi=-1,si=-1,ci=-1;for(let i=0;i<h.length;i++){if(di<0&&/data/.test(h[i]))di=i;if(de<0&&/descri/.test(h[i]))de=i;if(vi<0&&/valor/.test(h[i]))vi=i;if(si<0&&/fonte/.test(h[i]))si=i;if(ci<0&&/moeda|currency|cur\b/.test(h[i]))ci=i;}if(di<0)di=0;if(de<0)de=si>=0?2:1;if(vi<0)vi=h.length>=4?3:2;const txns=[];for(let i=1;i<rows.length;i++){const r=rows[i];if(!r||r.length<2)continue;const desc=String(r[de]||"").trim();const rawVal=r[vi];const {value:val,currency:detectedCur}=parseValWithCurrency(rawVal);const date=parseDate(r[di]);if(!desc||val===0)continue;const ac=categorizeStatic(desc);const currency=ci>=0?String(r[ci]||"").trim().toUpperCase()||detectedCur:detectedCur;txns.push({id:fn+"-"+i,date,description:desc,value:val,currency,originalValue:val,brlValue:currency==="BRL"?val:val,exchangeRate:currency==="BRL"?1:null,category:ac,source:si>=0?String(r[si]||"").trim():fn,monthKey:getMonthKey(date),confirmed:ac!==null});}return txns;}
+function extractTxns(rows,fn){
+  if(!rows||rows.length<2)return[];
+  // Detect if first row is a title (e.g., "EXTRATO CONTA CORRENTE") and skip to actual header
+  let headerIdx=0;
+  for(let r=0;r<Math.min(5,rows.length);r++){
+    const row=rows[r];if(!row)continue;
+    const h=row.map(x=>String(x||"").toLowerCase().trim());
+    if(h.some(c=>/^data/.test(c))&&h.some(c=>/valor|amount/.test(c))){headerIdx=r;break;}
+  }
+  const h=rows[headerIdx].map(x=>String(x||"").toLowerCase().trim());
+  let di=-1,de=-1,vi=-1,si=-1,ci=-1;
+  for(let i=0;i<h.length;i++){
+    if(di<0&&/^data/.test(h[i]))di=i;
+    if(de<0&&/descri|hist[oó]ri|memo/.test(h[i]))de=i;
+    if(vi<0&&/valor|amount/.test(h[i]))vi=i;
+    if(si<0&&/fonte|origem|source/.test(h[i]))si=i;
+    if(ci<0&&/moeda|currency|cur\b/.test(h[i]))ci=i;
+  }
+  if(di<0)di=0;if(de<0)de=si>=0?2:1;if(vi<0)vi=h.length>=4?3:2;
+  const txns=[];let lastDate=null;
+  for(let i=headerIdx+1;i<rows.length;i++){
+    const r=rows[i];if(!r||r.length<2)continue;
+    const desc=String(r[de]||"").trim();const rawVal=r[vi];
+    const {value:val,currency:detectedCur}=parseValWithCurrency(rawVal);
+    // For Sicoob extracts: rows without date are continuation lines (PIX details) — skip
+    const date=parseDate(r[di]);
+    if(date)lastDate=date;
+    if(!desc||val===0)continue;
+    if(!date&&!lastDate)continue; // Skip if no date context
+    const useDate=date||lastDate;
+    const ac=categorizeStatic(desc);
+    const currency=ci>=0?String(r[ci]||"").trim().toUpperCase()||detectedCur:detectedCur;
+    let srcRaw=si>=0?String(r[si]||"").trim():"";
+    const source=srcRaw?srcRaw.replace(/\b\w/g,c=>c.toUpperCase()):fn;
+    txns.push({id:fn+"-"+i,date:useDate,description:desc,value:val,currency,originalValue:val,brlValue:currency==="BRL"?val:val,exchangeRate:currency==="BRL"?1:null,category:ac,source,monthKey:getMonthKey(useDate),confirmed:ac!==null});
+  }
+  return txns;
+}
 
 // ─── Duplicate Detection ─────────────────────────────────────────────────────
 function txnFingerprint(t){
@@ -959,7 +996,13 @@ export default function App(){
   const pieTotalValue=useMemo(()=>pieData.reduce((s,d)=>s+d.value,0),[pieData]);
 
   // ─── Handlers ──────────────────────────────────────────────────────────────
-  const handleFiles=useCallback(async(fileList)=>{const res=[];for(const f of fileList){try{if(f.name.toLowerCase().endsWith(".pdf")){setUploadStatus({msg:"Extraindo texto de "+f.name+"...",loading:true});const text=await parsePdfFile(f);if(!text||text.trim().length<30){setUploadStatus({msg:"Erro: não conseguiu extrair texto do PDF ("+text.length+" chars). Pode ser PDF de imagem.",loading:false});continue;}setUploadStatus({msg:"IA extraindo transações ("+text.length+" chars)...",loading:true});const{txns:pdfTxns,sourceName,apiError}=await extractTxnsFromPdfAI(text,f.name);if(apiError&&pdfTxns.length===0){setUploadStatus({msg:"Erro: "+apiError,loading:false});continue;}res.push(...pdfTxns);setUploadStatus({msg:pdfTxns.length+" transações extraídas — "+sourceName,loading:false});}else{const buf=await f.arrayBuffer();const wb=XLSX.read(new Uint8Array(buf),{type:"array",cellDates:true});const ws=wb.Sheets[wb.SheetNames[0]];const rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:false,dateNF:"yyyy-mm-dd"});res.push(...extractTxns(rows,f.name));}setFiles(p=>[...p,f.name]);}catch(e){console.error(e);setUploadStatus({msg:"Erro: "+f.name,loading:false});}}
+  const handleFiles=useCallback(async(fileList)=>{const res=[];for(const f of fileList){try{if(f.name.toLowerCase().endsWith(".pdf")){setUploadStatus({msg:"Extraindo texto de "+f.name+"...",loading:true});const text=await parsePdfFile(f);if(!text||text.trim().length<30){setUploadStatus({msg:"Erro: não conseguiu extrair texto do PDF ("+text.length+" chars). Pode ser PDF de imagem.",loading:false});continue;}setUploadStatus({msg:"IA extraindo transações ("+text.length+" chars)...",loading:true});const{txns:pdfTxns,sourceName,apiError}=await extractTxnsFromPdfAI(text,f.name);if(apiError&&pdfTxns.length===0){setUploadStatus({msg:"Erro: "+apiError,loading:false});continue;}res.push(...pdfTxns);setUploadStatus({msg:pdfTxns.length+" transações extraídas — "+sourceName,loading:false});}else{const buf=await f.arrayBuffer();const wb=XLSX.read(new Uint8Array(buf),{type:"array",cellDates:true});
+  // Process ALL sheets in the workbook (not just the first)
+  for(const sheetName of wb.SheetNames){
+    const ws=wb.Sheets[sheetName];const rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:false,dateNF:"yyyy-mm-dd"});
+    const sheetLabel=wb.SheetNames.length>1?f.name+" ("+sheetName+")":f.name;
+    res.push(...extractTxns(rows,sheetLabel));
+  }}setFiles(p=>[...p,f.name]);}catch(e){console.error(e);setUploadStatus({msg:"Erro: "+f.name,loading:false});}}
     // Convert foreign currency transactions from XLSX to BRL
     for(const t of res){
       if(t.currency && t.currency!=="BRL" && !t.exchangeRate){
