@@ -462,26 +462,66 @@ const _SB_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
 const supabase = _SB_URL && _SB_KEY ? createClient(_SB_URL, _SB_KEY) : null;
 const CLIENT_ID = Math.random().toString(36).slice(2, 10);
 
-// Storage: Supabase cloud → localStorage fallback
+// Storage: Supabase cloud + localStorage (use most recent)
 if (typeof window !== "undefined") {
   window.storage = {
     get: async (key) => {
+      let cloudData=null, localData=null;
+      // Fetch from Supabase
       if (supabase) {
         try {
           const { data, error } = await supabase.from('app_state').select('data').eq('id', key).single();
-          if (!error && data?.data) return { value: JSON.stringify(data.data) };
-        } catch (e) { /* fallback below */ }
+          if (!error && data?.data) cloudData = data.data;
+        } catch (e) { /* no cloud data */ }
       }
-      try { return { value: localStorage.getItem(key) }; } catch(e) { return null; }
+      // Fetch from localStorage
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) localData = JSON.parse(raw);
+      } catch(e) { /* no local data */ }
+      // If only one source has data, use it
+      if (cloudData && !localData) return { value: JSON.stringify(cloudData) };
+      if (!cloudData && localData) return { value: JSON.stringify(localData) };
+      if (!cloudData && !localData) return null;
+      // Both exist: compare _savedAt timestamps, fall back to txn count
+      const cloudTs = cloudData._savedAt ? new Date(cloudData._savedAt).getTime() : 0;
+      const localTs = localData._savedAt ? new Date(localData._savedAt).getTime() : 0;
+      if (cloudTs > 0 || localTs > 0) {
+        const winner = cloudTs >= localTs ? cloudData : localData;
+        // Sync the winner to the other store
+        if (cloudTs < localTs && supabase) {
+          localData._clientId = CLIENT_ID;
+          supabase.from('app_state').upsert({ id: key, data: localData, updated_at: new Date().toISOString() }).catch(()=>{});
+        }
+        return { value: JSON.stringify(winner) };
+      }
+      // No timestamps: use whichever has more transactions
+      const cloudTxns = Array.isArray(cloudData.txns) ? cloudData.txns.length : 0;
+      const localTxns = Array.isArray(localData.txns) ? localData.txns.length : 0;
+      const best = localTxns >= cloudTxns ? localData : cloudData;
+      // Sync winner up
+      if (localTxns >= cloudTxns && supabase) {
+        localData._clientId = CLIENT_ID;
+        supabase.from('app_state').upsert({ id: key, data: localData, updated_at: new Date().toISOString() }).catch(()=>{});
+      }
+      return { value: JSON.stringify(best) };
     },
     set: async (key, val) => {
-      try { localStorage.setItem(key, val); } catch(e) {}
-      if (supabase) {
-        try {
-          const parsed = JSON.parse(val);
-          parsed._clientId = CLIENT_ID;
-          await supabase.from('app_state').upsert({ id: key, data: parsed, updated_at: new Date().toISOString() });
-        } catch (e) { console.warn('Cloud sync failed', e); }
+      // Inject timestamp
+      try {
+        const parsed = JSON.parse(val);
+        parsed._savedAt = new Date().toISOString();
+        const stamped = JSON.stringify(parsed);
+        try { localStorage.setItem(key, stamped); } catch(e) {}
+        if (supabase) {
+          try {
+            parsed._clientId = CLIENT_ID;
+            await supabase.from('app_state').upsert({ id: key, data: parsed, updated_at: new Date().toISOString() });
+          } catch (e) { console.warn('Cloud sync failed', e); }
+        }
+      } catch(e) {
+        // Fallback: save raw
+        try { localStorage.setItem(key, val); } catch(e2) {}
       }
     },
     delete: async (key) => {
