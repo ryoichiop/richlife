@@ -463,6 +463,37 @@ const supabase = _SB_URL && _SB_KEY ? createClient(_SB_URL, _SB_KEY) : null;
 const CLIENT_ID = Math.random().toString(36).slice(2, 10);
 
 // Storage: Supabase cloud + localStorage (always prefer the most complete data)
+// Rolling backup: keep last 3 snapshots in Supabase before overwriting
+let _lastBackupTxnCount = 0;
+let _lastBackupTime = 0;
+const BACKUP_SLOTS = 3;
+const BACKUP_INTERVAL_MS = 5 * 60 * 1000; // Max 1 backup every 5 minutes
+
+async function _saveBackup(data) {
+  if (!supabase) return;
+  const txnCount = Array.isArray(data.txns) ? data.txns.length : 0;
+  const now = Date.now();
+  // Only backup if: has meaningful data AND (txn count changed significantly OR 5+ min elapsed)
+  if (txnCount <= 77) return; // Skip seed-only data
+  if (Math.abs(txnCount - _lastBackupTxnCount) < 5 && now - _lastBackupTime < BACKUP_INTERVAL_MS) return;
+  _lastBackupTxnCount = txnCount;
+  _lastBackupTime = now;
+  try {
+    // Find the oldest backup slot to overwrite
+    const { data: existing } = await supabase.from('app_state').select('id,updated_at').like('id', 'richlife-backup-%');
+    let slotId;
+    if (!existing || existing.length < BACKUP_SLOTS) {
+      slotId = `richlife-backup-${(existing?.length || 0) + 1}`;
+    } else {
+      // Overwrite oldest
+      existing.sort((a, b) => new Date(a.updated_at) - new Date(b.updated_at));
+      slotId = existing[0].id;
+    }
+    await supabase.from('app_state').upsert({ id: slotId, data: { ...data, _backupAt: new Date().toISOString(), _txnCount: txnCount }, updated_at: new Date().toISOString() });
+    console.log('[Backup] Saved to', slotId, '(' + txnCount + ' txns)');
+  } catch (e) { console.warn('[Backup] Failed:', e); }
+}
+
 if (typeof window !== "undefined") {
   window.storage = {
     get: async (key) => {
@@ -527,6 +558,8 @@ if (typeof window !== "undefined") {
         parsed._savedAt = new Date().toISOString();
         const stamped = JSON.stringify(parsed);
         try { localStorage.setItem(key, stamped); } catch(e) {}
+        // Save rolling backup BEFORE overwriting cloud (safety net)
+        _saveBackup(parsed).catch(()=>{});
         if (supabase) {
           try {
             parsed._clientId = CLIENT_ID;
@@ -542,6 +575,22 @@ if (typeof window !== "undefined") {
       try { localStorage.removeItem(key); } catch(e) {}
       if (supabase) { try { await supabase.from('app_state').delete().eq('id', key); } catch(e) {} }
     },
+  };
+  // Expose backup recovery utility on window for emergency use
+  window._recoverFromBackup = async (slotNum) => {
+    if (!supabase) { console.log('No Supabase'); return; }
+    const id = `richlife-backup-${slotNum || 1}`;
+    const { data, error } = await supabase.from('app_state').select('data').eq('id', id).single();
+    if (error || !data?.data) { console.log('No backup at', id); return null; }
+    console.log('Found backup:', id, 'with', (data.data.txns||[]).length, 'txns, backed up at', data.data._backupAt);
+    return data.data;
+  };
+  window._listBackups = async () => {
+    if (!supabase) { console.log('No Supabase'); return; }
+    const { data } = await supabase.from('app_state').select('id,updated_at,data').like('id', 'richlife-backup-%');
+    if (!data || data.length === 0) { console.log('No backups found'); return; }
+    data.forEach(b => console.log(b.id, '|', (b.data?.txns||[]).length, 'txns |', b.data?._backupAt || b.updated_at));
+    return data;
   };
 }
 
@@ -794,6 +843,37 @@ export default function App(){
     };
     reader.readAsText(file);
     e.target.value="";
+  },[]);
+
+  // Recover from cloud backup
+  const handleRecoverBackup=useCallback(async()=>{
+    if(!supabase){alert("Supabase não configurado.");return;}
+    try{
+      const {data:backups}=await supabase.from('app_state').select('id,updated_at,data').like('id','richlife-backup-%');
+      if(!backups||backups.length===0){alert("Nenhum backup encontrado na nuvem.");return;}
+      const options=backups.map(b=>{
+        const txns=Array.isArray(b.data?.txns)?b.data.txns.length:0;
+        const cat=b.data?.txns?b.data.txns.filter(t=>t.confirmed).length:0;
+        return `${b.id}: ${txns} transações (${cat} categorizadas) — ${b.data?._backupAt||b.updated_at}`;
+      }).join("\n");
+      const choice=prompt("Backups disponíveis:\n\n"+options+"\n\nDigite o número do backup (1, 2 ou 3):");
+      if(!choice)return;
+      const slotId=`richlife-backup-${choice.trim()}`;
+      const match=backups.find(b=>b.id===slotId);
+      if(!match){alert("Backup não encontrado: "+slotId);return;}
+      const d=match.data;
+      if(!confirm("Restaurar backup com "+(d.txns||[]).length+" transações? Isso substituirá seus dados atuais.")){return;}
+      if(d.categories)setCategories(d.categories);
+      if(d.txns)setTxns(deserializeTxns(d.txns));
+      if(d.income)setIncome(d.income);
+      if(d.budget)setBudget(d.budget);
+      if(d.investments)setInvestments(d.investments);
+      if(d.files)setFiles(d.files);
+      if(d.completedMonths)setCompletedMonths(d.completedMonths);
+      if(d.learnedPatterns)setLearnedPatterns(d.learnedPatterns);
+      setSaveStatus("restaurado ✓");
+      alert("Backup restaurado com sucesso! ("+((d.txns||[]).length)+" transações)");
+    }catch(e){alert("Erro ao restaurar: "+e.message);}
   },[]);
 
   const catNames=useMemo(()=>categories.map(c=>c.name),[categories]);
@@ -1110,6 +1190,7 @@ export default function App(){
             <button onClick={handleExportBackup} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Exportar backup JSON">💾</button>
             <label style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Importar backup JSON">📂<input type="file" accept=".json" onChange={handleImportBackup} style={{display:"none"}}/></label>
             {supabase&&<button onClick={handleForceUpload} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Forçar envio para nuvem">⬆☁</button>}
+            {supabase&&<button onClick={handleRecoverBackup} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Restaurar backup da nuvem">🔄</button>}
             <button onClick={handleResetData} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Resetar todos os dados">↺</button>
           </>}
         </div>
