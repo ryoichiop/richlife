@@ -606,6 +606,7 @@ export default function App(){
   const [learnedPatterns,setLearnedPatterns]=useState([]);
   const [recatResult,setRecatResult]=useState(null);
   const [pieMonths,setPieMonths]=useState([]);
+  const [syncConflict,setSyncConflict]=useState(null); // {remoteTxns, localTxns, remoteData}
 
   // Responsive
   const [winW,setWinW]=useState(typeof window!=="undefined"?window.innerWidth:1440);
@@ -714,6 +715,16 @@ export default function App(){
       (payload)=>{
         const d=payload.new?.data;
         if(!d||d._clientId===CLIENT_ID)return;
+        // SAFETY: Reject remote updates that have significantly fewer transactions than local
+        const remoteTxnCount=Array.isArray(d.txns)?d.txns.length:0;
+        const localTxnCount=txns.length;
+        if(localTxnCount>50 && remoteTxnCount<localTxnCount*0.5){
+          console.warn('[Sync] REJECTED remote update: remote has',remoteTxnCount,'txns vs local',localTxnCount,'txns. Keeping local data.');
+          setSyncConflict({remoteTxns:remoteTxnCount,localTxns:localTxnCount,remoteData:d});
+          // Re-push local data to overwrite the bad remote data
+          window.storage.set(STORAGE_KEY,serializeData({categories,txns,income,budget,investments,files,completedMonths,learnedPatterns}));
+          return;
+        }
         isRemoteUpdate.current=true;
         // Clear undo/redo history on remote sync to avoid conflicts
         setTxnHistory([]);setTxnFuture([]);setInvHistory([]);setInvFuture([]);
@@ -729,13 +740,60 @@ export default function App(){
       }
     ).subscribe();
     return()=>{supabase.removeChannel(channel);};
-  },[loaded]);
+  },[loaded,txns,categories,income,budget,investments,files,completedMonths,learnedPatterns]);
 
   const handleResetData=useCallback(async()=>{
     if(!confirm("Isso vai apagar TODOS os seus dados salvos e voltar ao estado inicial. Tem certeza?"))return;
     try{await window.storage.delete(STORAGE_KEY);}catch(e){}
     setCategories(DEFAULT_CATEGORIES);setTxns(INIT_TXNS);setIncome(INIT_INCOME);
     setBudget(INIT_BUDGET);setInvestments([]);setFiles([]);setCompletedMonths({});setLearnedPatterns([]);
+  },[]);
+
+  // Force upload local data to cloud (data recovery)
+  const handleForceUpload=useCallback(async()=>{
+    if(!supabase){alert("Supabase não configurado.");return;}
+    const data={categories,txns:txns.map(t=>({...t,date:t.date instanceof Date?t.date.toISOString():t.date})),income,budget,investments,files,completedMonths,learnedPatterns,_savedAt:new Date().toISOString(),_clientId:CLIENT_ID};
+    try{
+      await supabase.from('app_state').upsert({id:STORAGE_KEY,data,updated_at:new Date().toISOString()});
+      setSyncConflict(null);
+      setSaveStatus("forçado ↑ ☁");
+      alert("Dados deste navegador enviados para a nuvem com sucesso! (" + txns.length + " transações)");
+    }catch(e){alert("Erro ao enviar: "+e.message);}
+  },[categories,txns,income,budget,investments,files,completedMonths,learnedPatterns]);
+
+  // Export data as JSON backup file
+  const handleExportBackup=useCallback(()=>{
+    const data={categories,txns:txns.map(t=>({...t,date:t.date instanceof Date?t.date.toISOString():t.date})),income,budget,investments,files,completedMonths,learnedPatterns,_exportedAt:new Date().toISOString()};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;a.download=`rich-life-backup-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
+  },[categories,txns,income,budget,investments,files,completedMonths,learnedPatterns]);
+
+  // Import data from JSON backup file
+  const handleImportBackup=useCallback((e)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      try{
+        const data=JSON.parse(ev.target.result);
+        if(!data.txns||!Array.isArray(data.txns)){alert("Arquivo inválido.");return;}
+        if(!confirm("Importar backup com "+data.txns.length+" transações? Isso vai substituir seus dados atuais.")){return;}
+        if(data.categories)setCategories(data.categories);
+        if(data.txns)setTxns(deserializeTxns(data.txns));
+        if(data.income)setIncome(data.income);
+        if(data.budget)setBudget(data.budget);
+        if(data.investments)setInvestments(data.investments);
+        if(data.files)setFiles(data.files);
+        if(data.completedMonths)setCompletedMonths(data.completedMonths);
+        if(data.learnedPatterns)setLearnedPatterns(data.learnedPatterns);
+        setSaveStatus("importado ✓");
+        alert("Backup importado com sucesso!");
+      }catch(err){alert("Erro ao ler backup: "+err.message);}
+    };
+    reader.readAsText(file);
+    e.target.value="";
   },[]);
 
   const catNames=useMemo(()=>categories.map(c=>c.name),[categories]);
@@ -1048,9 +1106,23 @@ export default function App(){
               <button key={id} onClick={()=>setView(id)} style={{...S.btn,padding:isMobile?"6px 10px":"8px 16px",fontWeight:500,fontSize:isMobile?10:12,background:view===id?C.greenBg:"transparent",color:view===id?C.green:C.t3,borderRadius:10,whiteSpace:"nowrap"}}>{lb}</button>
             ))}
           </nav>
-          {!isMobile&&<button onClick={handleResetData} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Resetar todos os dados">↺</button>}
+          {!isMobile&&<>
+            <button onClick={handleExportBackup} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Exportar backup JSON">💾</button>
+            <label style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Importar backup JSON">📂<input type="file" accept=".json" onChange={handleImportBackup} style={{display:"none"}}/></label>
+            {supabase&&<button onClick={handleForceUpload} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Forçar envio para nuvem">⬆☁</button>}
+            <button onClick={handleResetData} style={{background:"none",border:"none",color:C.t4,cursor:"pointer",fontSize:11,padding:"6px 10px",fontFamily:"'Space Mono',monospace"}} title="Resetar todos os dados">↺</button>
+          </>}
         </div>
       </header>
+
+      {/* Sync conflict banner */}
+      {syncConflict&&<div style={{background:"#FFF3CD",border:"1px solid #F0C674",padding:"12px 28px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,fontSize:13}}>
+        <div><strong>⚠ Conflito de sincronização detectado:</strong> A nuvem recebeu {syncConflict.remoteTxns} transações, mas este navegador tem {syncConflict.localTxns}. <strong>Seus dados locais foram preservados.</strong></div>
+        <div style={{display:"flex",gap:8,flexShrink:0}}>
+          <button onClick={()=>{handleForceUpload();}} style={{...S.btn,padding:"6px 14px",background:C.green,color:"#fff",borderRadius:8,fontSize:12,fontWeight:600}}>Enviar meus dados ↑</button>
+          <button onClick={()=>setSyncConflict(null)} style={{...S.btn,padding:"6px 14px",background:"#eee",color:C.t2,borderRadius:8,fontSize:12}}>Fechar</button>
+        </div>
+      </div>}
 
       <main style={{padding:isMobile?"14px":"28px 28px",maxWidth:1440,margin:"0 auto"}}>
 
